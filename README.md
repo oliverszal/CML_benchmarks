@@ -14,4 +14,4 @@ Step-by-step guide:
 - have a GitHub account
 - run a codespace (green button)
 - have a D-Wave Leap account with valid token (https://cloud.dwavesys.com/leap/)
-- paste D-Wave token into the file 'dwave_token.py'
+- paste D-Wave token into the file 'dwave_token.py'.
