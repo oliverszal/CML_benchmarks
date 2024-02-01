@@ -12,6 +12,6 @@ Make sure to not push the token to any live branch.
 Step-by-step guide:
 ### Requirements:
 - have a GitHub account
-- run a codespace (green button)
+- run a codespace (green button with "<> Code")
 - have a D-Wave Leap account with valid token (https://cloud.dwavesys.com/leap/)
 - paste D-Wave token into the file 'dwave_token.py'
