@@ -9,9 +9,12 @@ To execute any of the .py or .ipynb files, you'll first need to paste in your D-
 To acquire such a token, you have to sign up to D-Waves cloud system "Leap" under https://cloud.dwavesys.com/leap/.
 Make sure to not push the token to any live branch.
 
+Heads up: Executing the .ipynb files requires choosing a Kernel. I recommend the standard recommended options, that is Python Environments... -> Python 3.11.7.
+
 Step-by-step guide:
 ### Requirements:
 - have a GitHub account
 - run a codespace (green button with "<> Code")
 - have a D-Wave Leap account with valid token (https://cloud.dwavesys.com/leap/)
 - paste D-Wave token into the file 'dwave_token.py'
+- When executing a ipynb file, choose Kernel Python Environments... -> Python 3.11.7
