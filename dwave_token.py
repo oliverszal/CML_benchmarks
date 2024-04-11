@@ -1,1 +1,1 @@
-value = '' # paste here your valid D-Wave token
+value = 'DEV-aa86a0d10ff384ab792d70b8d700652923f2fc0c' # paste here your valid D-Wave token
