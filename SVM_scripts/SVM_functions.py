@@ -14,6 +14,7 @@ import dimod
 import sklearn as skl
 from sklearn.gaussian_process.kernels import Kernel
 from sklearn.inspection import DecisionBoundaryDisplay
+from matplotlib.colors import ListedColormap
 import imblearn as imb
 try:
     import pyomo.environ as pyo
@@ -63,7 +64,8 @@ __all__ = [
     'qSVM_estimator',
     'slice_estimator',
     'hyperparameter_optimization',
-    'manual_classifier'
+    'manual_classifier',
+    'mean_estimator'
 ]
 
 lazy_embedding_timeout = 60
@@ -333,7 +335,7 @@ def optimize_bias(fs, vectors, labels, upper_bound, kernel, alphas=None, metric=
     else: # if alpha is provided, the argument fs is ignored
         alphas = np.atleast_2d(alphas)
         fs = [decision_function(vectors, labels, upper_bound, kernel, alpha, bias=0) for alpha in alphas]
-        standard_biases = [standard_bias(vectors, labels, upper_bound, kernel, alphas[i]) for i in range(len(fs))]
+        standard_biases = standard_bias(vectors, labels, upper_bound, kernel, alphas)
     decision_values = [f(vectors) for f in fs]
     f_values_lists = [np.unique(decision_values[i], return_index=True) for i in range(len(fs))] # sorted lists of all function values without dublicates
     bias_filters =  [[j for j in range(len(f_values_lists[i][0])-1) if labels[f_values_lists[i][1][j+1]] == 1 and (labels[f_values_lists[i][1][j]] == -1 or j == 0)] for i in range(len(fs))]
@@ -845,6 +847,7 @@ def plot_training_data_with_decision_boundary(classifyer, X=None, y=None, plot_m
         response_method="predict",
         plot_method="pcolormesh",
         alpha=0.3,
+        cmap=ListedColormap(["red", "blue"])
     )
     
     if plot_margins:
@@ -1213,7 +1216,7 @@ def estimator_add_bias(X, f, bias):
     f_value = f(X) + bias
     return(f_value)
 
-def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, print_info:bool=False):
+def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, folds:int=5, print_info=False):
     """Performs a hyperparameter optimization of an estimator object, in particular by cross validation with Stratified 5-Fold. Accuracy and Kappa value are applied as metric, and the optimization goes according to the Kappa value.
     Arguments:
                 estimator: estimator object with methods fit, predict and decision_function.
@@ -1223,6 +1226,7 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, pri
                     - if estimator is of class slice_estimator, the attributes of estimator.estimator are allowed
                   vectors: array of data vectors, of shape (N,d) with d>1.
                    labels: list or array of binary (1,-1) labels of shape (N).
+                    folds: int, number of folds to use in the crossvalidation. Default is 5
                print_info: Boolean wether info should be printed. Default is False.
 
     Returns:
@@ -1263,8 +1267,14 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, pri
         paramgrid = extend_param_names(paramgrid, list(paramgrid.keys()), 'sliced')
     else:
         pipeline = estimator
-    # run grid search with cross validation:
-    grid_search = skl.model_selection.GridSearchCV(pipeline, paramgrid, scoring=scoring, cv=5, refit='kappa')
+   # specify level of print detail
+    assert isinstance(print_info, (bool, int)), 'Wrong format of print_info. Try again with bool or int.'
+    if isinstance(print_info, bool):
+        print_detail = 2 if print_info else 0
+    elif isinstance(print_info, int):
+        print_detail = print_info
+     # run grid search with cross validation:
+    grid_search = skl.model_selection.GridSearchCV(pipeline, paramgrid, scoring=scoring, cv=folds, refit='kappa', verbose=print_detail)
     grid_search.fit(vectors, labels)
     cv_results = grid_search.cv_results_
     # export dataframe:
@@ -1325,6 +1335,50 @@ class manual_classifier(skl.base.BaseEstimator):
                         self.y_ = y
         except ValueError:
             raise ValueError('Use data of shape accroding to the custom decision function.')
+    def predict(self, X):
+        skl.utils.validation.check_is_fitted(self)
+        X = skl.utils.validation.check_array(X)
+        decision_value = self.decision_function(X)
+        return np.sign(decision_value)
+    
+class mean_estimator(skl.base.BaseEstimator):
+    """Estimator class that averages over estimators provided in its first argument.
+    Arguments:
+        estimators: list or array of estimators.
+
+    Returns:
+        estimator object with methods fit, predict and decision_function.
+    """
+    def __init__(self, *, estimators=[cSVM_estimator()]):
+        assert np.all([hasattr(estimator, 'decision_function') for estimator in estimators]), 'All estimators have to have a decision function.'
+        N = len(estimators)
+        self.estimators = estimators
+        def inherite_attributes_by_value(self, attr_name, attr_value, logic, exception):
+            if logic([getattr(estimator, attr_name, None) == attr_value for estimator in self.estimators]):
+                setattr(self, attr_name, attr_value)
+            elif exception:
+                setattr(self, attr_name, exception)
+        def union_attributes(self, attr_name):
+            union = []
+            for arr in [getattr(estimator, attr_name, []) for estimator in self.estimators]:
+                union = np.union1d(union, arr)
+            attr_value = np.array(list(set(union)))
+            setattr(self, attr_name, attr_value)
+        def inherite_attributes_if_same(self, attr_name):
+            inherite_attributes_by_value(self, attr_name, getattr(self.estimators[0], attr_name, None), np.all, False)
+            
+        union_attributes(self, 'classes_')
+        for param in self.estimators[0].get_params():
+            inherite_attributes_if_same(self, param)
+        for attr in ['is_fitted_', '_estimator_type']:
+            inherite_attributes_if_same(self, attr)
+    def decision_function(self, X):
+        mean = np.mean([estimator.decision_function(X) for estimator in self.estimators], axis=0)
+        return mean
+    def fit(self, X, y):
+        assert np.all([hasattr(estimator, 'fit') for estimator in self.estimators]), 'All estimators have to have a decision function.'
+        for estimator in self.estimators:
+            estimator.fit(X,y)
     def predict(self, X):
         skl.utils.validation.check_is_fitted(self)
         X = skl.utils.validation.check_array(X)
