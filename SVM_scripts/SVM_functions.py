@@ -6,6 +6,7 @@ import rdkit
 from rdkit.Chem import AllChem
 import inspect
 import copy
+import itertools
 import time
 import neal
 import dwave
@@ -1216,7 +1217,7 @@ def estimator_add_bias(X, f, bias):
     f_value = f(X) + bias
     return(f_value)
 
-def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, folds:int=5, print_info=False):
+def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, folds:int=5, filter=None, print_info=False):
     """Performs a hyperparameter optimization of an estimator object, in particular by cross validation with Stratified 5-Fold. Accuracy and Kappa value are applied as metric, and the optimization goes according to the Kappa value.
     Arguments:
                 estimator: estimator object with methods fit, predict and decision_function.
@@ -1227,6 +1228,7 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
                   vectors: array of data vectors, of shape (N,d) with d>1.
                    labels: list or array of binary (1,-1) labels of shape (N).
                     folds: int, number of folds to use in the crossvalidation. Default is 5
+                   filter: callable with boolean outputs and parameters in param_grid as inputs, filters the grid. Default is None, which means no filtering.
                print_info: Boolean wether info should be printed. Default is False.
 
     Returns:
@@ -1235,6 +1237,9 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
               grid_search: sklearn.model_selection.GridSearchCV object fitted with the best parameters. Useful attributes are cv_results_, best_estimator_, and best_params_.
     """
     scoring = {'accuracy': 'accuracy', 'kappa': skl.metrics.make_scorer(skl.metrics.cohen_kappa_score)}
+    # filter grid:
+    if callable(filter):
+        paramgrid = filter_grid(param_grid, filter) if callable(filter) else param_grid.copy() # copy to not change the original param_grid
     # check if kernel parameters have to be passed to the kernel parameters:
     def get_deep_attributes(estimator, attribute_name, condition=None):
         if condition is None:
@@ -1248,11 +1253,13 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
                 inner_params = [p for p in sig.parameters if p != 'self']
         return inner_params
     def extend_param_names(param_grid, param_names, prefix):
+        grid_iterator = param_grid if isinstance(param_grid, list) else [param_grid]
         for param in param_names:
-            if param in param_grid:
-                param_grid[prefix + '__' + param] = param_grid.pop(param)
+            for paramgrid in grid_iterator:
+                if param in paramgrid:
+                    paramgrid[prefix + '__' + param] = paramgrid.pop(param)
         return param_grid
-    paramgrid = param_grid.copy() # copy to not change the originl param_grid
+
     inner_kernel_params = get_deep_attributes(estimator, 'kernel', condition=callable)
     paramgrid = extend_param_names(paramgrid, inner_kernel_params, 'kernel')
     # check if estimator is the slice_estimator. If yes, we have to use a pipeline
@@ -1264,7 +1271,7 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
         paramgrid = extend_param_names(paramgrid, inner_kernel_params, 'estimator__kernel')
 
         pipeline = skl.pipeline.Pipeline([('sliced', estimator)])
-        paramgrid = extend_param_names(paramgrid, list(paramgrid.keys()), 'sliced')
+        paramgrid = extend_param_names(paramgrid, set().union(*(d.keys() for d in paramgrid)) if isinstance(paramgrid, list) else paramgrid.keys(), 'sliced')
     else:
         pipeline = estimator
    # specify level of print detail
@@ -1295,6 +1302,28 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
     optimal_params = grid_search.best_params_
     decision_function = grid_search.best_estimator_.decision_function
     return(decision_function, df_nice_sorted, grid_search)
+
+def filter_grid(param_grid, filter):
+    """
+    Filters parameter combinations based on a filter function and returns them 
+    with values wrapped in lists, as expected by GridSearchCV.
+    Parameters:
+    - param_grid (dict): Dictionary where keys are parameter names and values are lists of parameter values.
+    - filter_func (function): A function that takes the parameters as arguments and returns True or False.
+    Returns:
+    - filtered_params (list): A list of dictionaries with valid parameter combinations,
+                              each value wrapped in a list.
+    """
+    # Get all possible combinations from the parameter grid
+    param_names = param_grid.keys()
+    all_combinations = list(itertools.product(*param_grid.values()))
+    # Filter combinations using the provided filter function
+    filtered_combinations = [
+        {param: [value] for param, value in zip(param_names, values)}
+        for values in all_combinations
+        if filter(**dict(zip(param_names, values)))
+    ]
+    return filtered_combinations
 
 class manual_classifier(skl.base.BaseEstimator):
     """Estimator class that creates a classifier with a custom decision function, which already counts as fitted. This could be used to plot desicion_boundaries together with plot_training_data_with_decision_boundary.
