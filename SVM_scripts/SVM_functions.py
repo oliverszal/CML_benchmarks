@@ -1238,8 +1238,7 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
     """
     scoring = {'accuracy': 'accuracy', 'kappa': skl.metrics.make_scorer(skl.metrics.cohen_kappa_score)}
     # filter grid:
-    if callable(filter):
-        paramgrid = filter_grid(param_grid, filter) if callable(filter) else param_grid.copy() # copy to not change the original param_grid
+    paramgrid = filter_grid(param_grid, filter) if callable(filter) else param_grid.copy() # copy to not change the original param_grid
     # check if kernel parameters have to be passed to the kernel parameters:
     def get_deep_attributes(estimator, attribute_name, condition=None):
         if condition is None:
