@@ -267,7 +267,12 @@ def qSVM(vectors, labels, base=2, num_encoding=3, penalty=True, kernel=None, sol
     if isinstance(penalty, (bool)) and penalty == True:
         penalty = 0
     def sampleset_to_alphas(sampleset, samples):
-        filtered_sampleset = sampleset.filter(lambda sample: any(np.array([sum(sample.sample[K*n+k] for k in range(K)) not in [0,K] for n in range(N)]))) # filter sampleset by found support vectors
+        def support_condition(sample):
+            if K > 1 and not adjust_bias:
+                return any(np.array([sum(sample.sample[K*n+k] for k in range(K)) not in [0,K] for n in range(N)]))
+            else:
+                return any(np.array([sum(sample.sample[K*n+k] for k in range(K)) != 0 for n in range(N)]))
+        filtered_sampleset = sampleset.filter(support_condition) # filter sampleset by found support vectors
         if len(filtered_sampleset) == 0:
             raise Exception('No support vectors found')
         alphas = np.array([[sum(B**k * sample[K*n+k] for k in range(K)) for n in range(N)] for sample, in filtered_sampleset.data(fields=['sample'], sorted_by='energy')][:samples])
@@ -364,7 +369,9 @@ def standard_bias(vectors, labels, upper_bound, kernel, alpha):
     N = len(vectors)
     C = upper_bound
     kernel_terms = kernel(vectors, vectors)
-    b = np.einsum('fi,fi,fi->f', alpha, C - alpha, labels - np.einsum('ij,fj,j->fi', kernel_terms, alpha, labels)) / np.einsum('fi,fi->f', alpha, C - alpha)
+    numerator = np.einsum('fi,fi,fi->f', alpha, C - alpha, labels - np.einsum('ij,fj,j->fi', kernel_terms, alpha, labels))
+    denominator = np.einsum('fi,fi->f', alpha, C - alpha)
+    b = np.where(denominator != 0, numerator / denominator, 0)
     return(b)
 
 def decision_function(vectors, labels, upper_bound, kernel, alpha, bias=None):
@@ -626,6 +633,7 @@ def prepare_data_sets(vectors, labels, train_percentage=80, positive_negative_ra
     # sort test_vectors after test_labels:
     if test_vectors.size > 0:
         test_vectors, test_labels = zip(*sorted(zip(test_vectors, test_labels), key=lambda x: x[1], reverse=True))
+        test_vectors, test_labels = np.array(test_vectors), np.array(test_labels)
     if normalize_data:
         scaler = skl.preprocessing.StandardScaler()
         vectors = scaler.fit_transform(vectors)
@@ -797,7 +805,7 @@ def boxplot_compounds2(decision_values, labels, function_labels=['qSVM', 'cSVM']
         ], fontsize=7)
         ax[j].title.set_text(function_labels[j])
     if save:
-        if not isinstance(save, (str)): # standard name
+        if not isinstance(save, (str)): # default name
             save = 'plot'
         plt.savefig(save + '.png' ,dpi=300)
     plt.show()
@@ -807,7 +815,7 @@ def plot_curve(x, y, xlabel, ylabel, save=False):
     plt.xlabel(xlabel)
     plt.ylabel(ylabel)
     if save:
-        if not isinstance(save, (str)): # standard name
+        if not isinstance(save, (str)): # default name
             save = 'plot'
         plt.savefig(save + '.png' ,dpi=300)
     plt.show()
@@ -1155,7 +1163,7 @@ class slice_estimator(skl.base.BaseEstimator):
     """Estimator class to divide training data in slices and train it using an estimator of choice
     Arguments:
          estimator: estimator object with methods fit, predict and decision_function.
-        slice_size: int > 1, desired size of slices. Default is None, which means that the max possible slice slice will be chosen.
+        slice_size: int > 1, desired size of slices. Default is None, which means that the max possible slice size will be chosen.
               seed: None or int. Seed for randomness. The same seed should repeatedly give the same output. Default is None
         print_info: Boolean wether info should be printed. Default is False.
 
@@ -1270,7 +1278,7 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
         paramgrid = extend_param_names(paramgrid, inner_kernel_params, 'estimator__kernel')
 
         pipeline = skl.pipeline.Pipeline([('sliced', estimator)])
-        paramgrid = extend_param_names(paramgrid, set().union(*(d.keys() for d in paramgrid)) if isinstance(paramgrid, list) else paramgrid.keys(), 'sliced')
+        paramgrid = extend_param_names(paramgrid, set().union(*(d.keys() for d in paramgrid)) if isinstance(paramgrid, list) else list(paramgrid.keys()), 'sliced')
     else:
         pipeline = estimator
    # specify level of print detail
