@@ -65,6 +65,7 @@ __all__ = [
     'qSVM_estimator',
     'slice_estimator',
     'hyperparameter_optimization',
+    'count_gridsearch_fits',
     'manual_classifier',
     'mean_estimator'
 ]
@@ -371,7 +372,8 @@ def standard_bias(vectors, labels, upper_bound, kernel, alpha):
     kernel_terms = kernel(vectors, vectors)
     numerator = np.einsum('fi,fi,fi->f', alpha, C - alpha, labels - np.einsum('ij,fj,j->fi', kernel_terms, alpha, labels))
     denominator = np.einsum('fi,fi->f', alpha, C - alpha)
-    b = np.where(denominator != 0, numerator / denominator, 0)
+    with np.errstate(divide='ignore', invalid='ignore'): # ignore division error
+        b = np.where(denominator != 0, numerator / denominator, 0)
     return(b)
 
 def decision_function(vectors, labels, upper_bound, kernel, alpha, bias=None):
@@ -638,7 +640,6 @@ def prepare_data_sets(vectors, labels, train_percentage=80, positive_negative_ra
         scaler = skl.preprocessing.StandardScaler()
         vectors = scaler.fit_transform(vectors)
         if test_vectors.size > 0:
-            print(test_vectors)
             test_vectors = scaler.transform(test_vectors)
     if print_info:
         print('Training data size: {} ({} positive, {} negative)'.format(len(vectors), sum(1 for label in labels if label > 0), sum(1 for label in labels if label < 0)))
@@ -1083,6 +1084,10 @@ class cSVM_estimator(skl.base.BaseEstimator):
             return estimator_add_bias(X, self.decision_function_, self.bias_)
         else:
             return estimator_decision_function(X, self.X_, self.y_, self.alpha_, self.bias_, self.kernel, self.solver)
+    def score(self, X, y):
+        skl.utils.validation.check_is_fitted(self)
+        y_pred = self.predict(X)
+        return skl.metrics.accuracy_score(y, y_pred)
     
 class qSVM_estimator(skl.base.BaseEstimator):
     """Estimator class to quantumly train a SVM by converting the corresponding quadratic optimization problem into QUBO format and solving it with annealing methods.
@@ -1158,6 +1163,10 @@ class qSVM_estimator(skl.base.BaseEstimator):
     def decision_function(self, X):
         skl.utils.validation.check_is_fitted(self)
         return estimator_decision_function(X, self.X_, self.y_, self.alpha_, self.bias_, self.kernel, self.solver)
+    def score(self, X, y):
+        skl.utils.validation.check_is_fitted(self)
+        y_pred = self.predict(X)
+        return skl.metrics.accuracy_score(y, y_pred)
     
 class slice_estimator(skl.base.BaseEstimator):
     """Estimator class to divide training data in slices and train it using an estimator of choice
@@ -1206,6 +1215,10 @@ class slice_estimator(skl.base.BaseEstimator):
     def decision_function(self, X):
         skl.utils.validation.check_is_fitted(self)
         return np.mean([slice_estimator.decision_function(X) for slice_estimator in self.slice_estimators_], axis=0)
+    def score(self, X, y):
+        skl.utils.validation.check_is_fitted(self)
+        y_pred = self.predict(X)
+        return skl.metrics.accuracy_score(y, y_pred)
     
 def estimator_decision_function(X, vectors, labels, alpha, bias, kernel, solver):
     kernel, gamma, degree, coef0 = transform_kernel_argument(kernel, solver, vectors)
@@ -1243,8 +1256,105 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
         decision_function: classyfing function of the estimator fitted with the best parameters (with the best kappa value in the cross validation).
            df_nice_sorted: pandas data frame of hyperparameter values and associated metrics in the cross validation.
               grid_search: sklearn.model_selection.GridSearchCV object fitted with the best parameters. Useful attributes are cv_results_, best_estimator_, and best_params_.
+           optimal_params: dictionary of tzhe best parameters.
     """
     scoring = {'accuracy': 'accuracy', 'kappa': skl.metrics.make_scorer(skl.metrics.cohen_kappa_score)}
+   # specify level of print detail
+    assert isinstance(print_info, (bool, int)), 'Wrong format of print_info. Try again with bool or int.'
+    if isinstance(print_info, bool):
+        print_detail = 2 if print_info else 0
+    elif isinstance(print_info, int):
+        print_detail = print_info
+    # prepare pipeline and grid:
+    pipeline, paramgrid = prepare_pipeline(estimator, param_grid, filter) 
+    # run grid search with cross validation:
+    grid_search = skl.model_selection.GridSearchCV(pipeline, paramgrid, scoring=scoring, cv=folds, refit='kappa', verbose=print_detail)
+    grid_search.fit(vectors, labels)
+    cv_results = grid_search.cv_results_
+    # export dataframe:
+    df_results = pd.DataFrame(cv_results)
+    df_results = df_results.applymap(lambda x: x.filled(np.nan) if isinstance(x, np.ma.MaskedArray) else x)
+    # Select relevant columns
+    # Typically, we are interested in params and mean_test_score
+    params = df_results.iloc[:, 1:].filter(like="param_")
+    scores = df_results[['mean_test_kappa', 'std_test_kappa']]
+    # Relabel:
+    params.columns = params.columns.str.split('__').str[-1]
+    scores.columns = scores.columns.str.replace('_test_', ' ')
+    # Combine params and scores into a single DataFrame
+    df_nice = pd.concat([params, scores], axis=1)
+    df_nice_sorted = df_nice.sort_values(by='mean kappa', ascending=False)
+    if print_info:
+        display(df_nice_sorted)
+    optimal_params = grid_search.best_params_
+    decision_function = grid_search.best_estimator_.decision_function
+    return(decision_function, df_nice_sorted, grid_search, optimal_params)
+
+def count_gridsearch_fits(estimator, param_grid:dict, vectors, labels, folds=5, filter=None):
+    """
+    Estimates the number of fits that will be cast during a run of the function hyperparameter_optimization with the same parameters.
+    This may be useful to estimate the computation time of a hyperparameter optimization run.
+     
+    Arguments:
+                estimator: estimator object with methods fit, predict and decision_function.
+               param_grid: dictionary with parameter names (str) as values and lists of values as values. Allowed parameters are:
+                    - attributes of the estimator
+                    - if estimator.kernel is callable and has attributes, the names of these attributes are allowed.
+                    - if estimator is of class slice_estimator, the attributes of estimator.estimator are allowed
+                  vectors: array of data vectors, of shape (N,d) with d>1.
+                   labels: list or array of binary (1,-1) labels of shape (N).
+                    folds: int, number of folds to use in the crossvalidation. Default is 5
+                   filter: callable with boolean outputs and parameters in param_grid as inputs, filters the grid. Default is None, which means no filtering.
+
+    Returns:
+               total_fits: Total number of fits performed during hyperparameter optimization.
+    """
+    # reset fit counter:
+    FitCounter.fit_counts_global = defaultdict(int)
+    # prepare pipeline and grid:
+    pipeline, paramgrid = prepare_pipeline(estimator, param_grid, filter)
+    # Function to recursively replace base estimators (e.g., in ensemble methods) with FitCounter
+    def replace_nested_estimators_with_fit_counter(estimator, step_name_prefix=''):
+        if isinstance(estimator, skl.pipeline.Pipeline):
+            # Replace steps in pipeline
+            for name, step in estimator.steps:
+                step_name = f"{step_name_prefix}__{name}" if step_name_prefix else name
+                estimator.named_steps[name] = replace_nested_estimators_with_fit_counter(step, step_name)
+        elif hasattr(estimator, 'estimator') and isinstance(estimator.estimator, skl.base.BaseEstimator):
+            # If the estimator has another estimator as a parameter (like in BaggingClassifier, GridSearchCV)
+            estimator.estimator = replace_nested_estimators_with_fit_counter(estimator.estimator, step_name_prefix)
+        elif hasattr(estimator, 'steps') and isinstance(estimator.steps, list):
+            # If it’s a pipeline, replace each step
+            estimator.steps = [(name, replace_nested_estimators_with_fit_counter(step, step_name_prefix)) 
+                            for name, step in estimator.steps]
+        else:
+            # If it's a regular estimator, replace it with FitCounter
+            return FitCounter(step_name=step_name_prefix)
+        return estimator
+    
+    pipeline, paramgrid = prepare_pipeline(estimator, param_grid, filter)
+    # Replace the pipeline estimators with FitCounter at all levels
+    fit_counter_pipeline = replace_nested_estimators_with_fit_counter(pipeline)
+    
+    grid_search = skl.model_selection.GridSearchCV(fit_counter_pipeline, paramgrid, cv=folds, refit=True)
+    grid_search.fit(vectors, labels)
+    # Get the global fit counts for all steps
+    fit_counts = dict(FitCounter.fit_counts_global)
+    total_fits = sum(fit_counts.values())
+    return total_fits
+
+def prepare_pipeline(estimator, param_grid:dict, filter=None):
+    """
+    Prepares the pipeline and paramgrid object for hyperparameter optimization.
+    In particular, the grid is filtered and the names of the parameters are adjusted. 
+    Parameters:
+    - estimator: Estimator object used for hyperparameter optimization
+    - param_grid (dict): Dictionary where keys are parameter names and values are lists of parameter values.
+    - filter (function): A function that takes the parameters as arguments and returns True or False.
+    Returns:
+    - pipeline: estimator object for hyperparameter optimization that can handle inner parameters.
+    - paramgrid: The adjusted parameter grid. If a filter was used, it is a list of dicts of singe parameter choices.
+    """
     # filter grid:
     paramgrid = filter_grid(param_grid, filter) if callable(filter) else param_grid.copy() # copy to not change the original param_grid
     # check if kernel parameters have to be passed to the kernel parameters:
@@ -1266,7 +1376,6 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
                 if param in paramgrid:
                     paramgrid[prefix + '__' + param] = paramgrid.pop(param)
         return param_grid
-
     inner_kernel_params = get_deep_attributes(estimator, 'kernel', condition=callable)
     paramgrid = extend_param_names(paramgrid, inner_kernel_params, 'kernel')
     # check if estimator is the slice_estimator. If yes, we have to use a pipeline
@@ -1281,34 +1390,7 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
         paramgrid = extend_param_names(paramgrid, set().union(*(d.keys() for d in paramgrid)) if isinstance(paramgrid, list) else list(paramgrid.keys()), 'sliced')
     else:
         pipeline = estimator
-   # specify level of print detail
-    assert isinstance(print_info, (bool, int)), 'Wrong format of print_info. Try again with bool or int.'
-    if isinstance(print_info, bool):
-        print_detail = 2 if print_info else 0
-    elif isinstance(print_info, int):
-        print_detail = print_info
-     # run grid search with cross validation:
-    grid_search = skl.model_selection.GridSearchCV(pipeline, paramgrid, scoring=scoring, cv=folds, refit='kappa', verbose=print_detail)
-    grid_search.fit(vectors, labels)
-    cv_results = grid_search.cv_results_
-    # export dataframe:
-    df_results = pd.DataFrame(cv_results)
-    df_results = df_results.applymap(lambda x: x.filled(np.nan) if isinstance(x, np.ma.MaskedArray) else x)
-    # Select relevant columns
-    # Typically, we are interested in params and mean_test_score
-    params = df_results.iloc[:, 1:].filter(like="param_")
-    scores = df_results[['mean_test_kappa', 'std_test_kappa']]
-    # Relabel:
-    params.columns = params.columns.str.split('__').str[-1]
-    scores.columns = scores.columns.str.replace('_test_', ' ')
-    # Combine params and scores into a single DataFrame
-    df_nice = pd.concat([params, scores], axis=1)
-    df_nice_sorted = df_nice.sort_values(by='mean kappa', ascending=False)
-    if print_info:
-        display(df_nice_sorted)
-    optimal_params = grid_search.best_params_
-    decision_function = grid_search.best_estimator_.decision_function
-    return(decision_function, df_nice_sorted, grid_search)
+    return pipeline, paramgrid
 
 def filter_grid(param_grid, filter):
     """
@@ -1331,6 +1413,36 @@ def filter_grid(param_grid, filter):
         if filter(**dict(zip(param_names, values)))
     ]
     return filtered_combinations
+
+class FitCounter(skl.base.BaseEstimator, skl.base.TransformerMixin):
+    # Class-level dictionary to store fit counts globally for each step
+    fit_counts_global = defaultdict(int)
+    def __init__(self, step_name=None, **kwargs):
+        self.step_name = step_name  # Track the step name for unique counters
+        self.params = kwargs        # Store the arbitrary parameters
+    def fit(self, X, y=None):
+        # Increment the class-level counter for this step
+        FitCounter.fit_counts_global[self.step_name] += 1
+        return self
+    def transform(self, X):
+        return X
+    def fit_transform(self, X, y=None):
+        self.fit(X, y)
+        return self.transform(X)
+    def score(self, X, y=None):
+        # Return a constant score to satisfy GridSearchCV's requirements
+        return 1.0
+    def set_params(self, **params):
+        # Allow setting arbitrary parameters
+        self.params.update(params)
+        return self
+    def get_params(self, deep=True):
+        # Return stored parameters, required for GridSearchCV
+        return self.params
+    def predict(self, X):
+        return np.ones(len(X))
+    def decision_function(self, X):
+        return np.ones(len(X))
 
 class manual_classifier(skl.base.BaseEstimator):
     """Estimator class that creates a classifier with a custom decision function, which already counts as fitted. This could be used to plot desicion_boundaries together with plot_training_data_with_decision_boundary.
@@ -1376,6 +1488,10 @@ class manual_classifier(skl.base.BaseEstimator):
         X = skl.utils.validation.check_array(X)
         decision_value = self.decision_function(X)
         return np.sign(decision_value)
+    def score(self, X, y):
+        skl.utils.validation.check_is_fitted(self)
+        y_pred = self.predict(X)
+        return skl.metrics.accuracy_score(y, y_pred)
     
 class mean_estimator(skl.base.BaseEstimator):
     """Estimator class that averages over estimators provided in its first argument.
@@ -1420,3 +1536,7 @@ class mean_estimator(skl.base.BaseEstimator):
         X = skl.utils.validation.check_array(X)
         decision_value = self.decision_function(X)
         return np.sign(decision_value)
+    def score(self, X, y):
+        skl.utils.validation.check_is_fitted(self)
+        y_pred = self.predict(X)
+        return skl.metrics.accuracy_score(y, y_pred)
