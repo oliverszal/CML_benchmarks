@@ -6,6 +6,7 @@ import rdkit
 from rdkit.Chem import AllChem
 import inspect
 import copy
+import warnings
 import itertools
 import time
 import neal
@@ -17,6 +18,7 @@ from sklearn.gaussian_process.kernels import Kernel
 from sklearn.inspection import DecisionBoundaryDisplay
 from matplotlib.colors import ListedColormap
 import imblearn as imb
+import skopt
 try:
     import pyomo.environ as pyo
     from amplpy import modules
@@ -65,9 +67,13 @@ __all__ = [
     'qSVM_estimator',
     'slice_estimator',
     'hyperparameter_optimization',
-    'count_gridsearch_fits',
+    'count_hyperparameter_optimization_fits',
     'manual_classifier',
-    'mean_estimator'
+    'mean_estimator',
+    'estimate_search_space_size',
+    'split_dwave_search_space',
+    'samples_per_size',
+    'cv_results_to_df'
 ]
 
 lazy_embedding_timeout = 60
@@ -390,7 +396,7 @@ def decision_function(vectors, labels, upper_bound, kernel, alpha, bias=None):
                   f: classifying function that takes single or an array of vectors of length d.
     '''
     N = len(vectors)
-    if bias == None: # standard bias:
+    if bias is None: # standard bias:
         b = standard_bias(vectors, labels, upper_bound, kernel, np.atleast_2d(alpha))
     else: # custom bias:
         b = bias
@@ -537,17 +543,36 @@ def read_parquet(file_name):
                  labels: array of labels of the compounds, binary in [-1,+1].
                  names: array of names of the compounds.
     '''
+    smiles_keys = ['Drug', 'MOL_smiles']
+    label_keys = ['Y', 'PUBCHEM_ACTIVITY_OUTCOME', 'PHENOTYPE']
     df = pd.read_parquet(file_name)
-    smiles=df['Drug']
+    # extract smiles:
+    for key in smiles_keys:
+        try:
+            smiles=df[key]
+            break
+        except KeyError:
+            pass
     fps=[]
+    # generate fingerprints:
     for s in smiles:
         rdkit.RDLogger.DisableLog('rdApp.*')  # suppress depreciation warnings
         mol = rdkit.Chem.MolFromSmiles(s)
         fp = AllChem.GetMorganFingerprintAsBitVect(mol, 4, nBits=1024)
         fps.append(fp)
     matrix = np.array(fps)
-    matrix_labels = 2*df['Y'].to_numpy() - 1
-    names = df['Drug_ID'].to_numpy()
+    # extract labels:
+    for key in label_keys:
+        try:
+            matrix_labels = 2*df[key].to_numpy() - 1
+            break
+        except KeyError:
+            pass
+    # extract names:
+    try:
+        names = df['Drug_ID'].to_numpy()
+    except KeyError:
+        names = np.arange(len(df))
     return matrix, matrix_labels, names
 
 def prepare_data_sets(vectors, labels, train_percentage=80, positive_negative_ratio=None, max_train_size=None, min_train_size=None, normalize_data=False, seed=None, print_info=True):
@@ -634,8 +659,7 @@ def prepare_data_sets(vectors, labels, train_percentage=80, positive_negative_ra
         vectors, test_vectors, labels, test_labels = skl.model_selection.train_test_split(vectors, labels, test_size=relative_test_size, train_size=relative_train_size, random_state=seed)
     # sort test_vectors after test_labels:
     if test_vectors.size > 0:
-        test_vectors, test_labels = zip(*sorted(zip(test_vectors, test_labels), key=lambda x: x[1], reverse=True))
-        test_vectors, test_labels = np.array(test_vectors), np.array(test_labels)
+        test_vectors, test_labels = map(np.array, zip(*sorted(zip(test_vectors, test_labels), key=lambda x: x[1], reverse=True)))
     if normalize_data:
         scaler = skl.preprocessing.StandardScaler()
         vectors = scaler.fit_transform(vectors)
@@ -1179,10 +1203,11 @@ class slice_estimator(skl.base.BaseEstimator):
     Returns:
         estimator object with methods fit and predict.
     """
-    def __init__(self, *, estimator=skl.svm.SVC(), slice_size=None, force_unbiased=False, seed=None, print_info:bool=False):
+    def __init__(self, *, estimator=skl.svm.SVC(), slice_size=None, force_unbiased=False, adjust_outer_bias=False, seed=None, print_info:bool=False):
         self.estimator = estimator
         self.slice_size = slice_size
         self.force_unbiased = force_unbiased
+        self.adjust_outer_bias = adjust_outer_bias
         self.seed = seed
         self.print_info = print_info
     def fit(self, X, y):
@@ -1203,6 +1228,12 @@ class slice_estimator(skl.base.BaseEstimator):
             if self.print_info:
                 print('Training slice: {}/{}'.format(i+1, num_slices), end="\r")
             self.slice_estimators_[i].fit(vectors, labels)
+        self.mean_bias = np.mean([getattr(slice_estimator, 'bias_', 0) for slice_estimator in self.slice_estimators_])
+        if self.adjust_outer_bias:
+            f = lambda X: np.mean([slice_estimator.decision_function(X) for slice_estimator in self.slice_estimators_], axis=0) - self.mean_bias
+            self.bias = optimize_bias([f], self.X_, self.y_, upper_bound=None, kernel=None, alphas=None, metric=self.adjust_outer_bias, print_info=False)[0]
+        else:
+            self.bias = self.mean_bias
         self.is_fitted_ = True
         if self.print_info: # clear the previous print
             print(' ' * 25, end="\r")
@@ -1210,11 +1241,14 @@ class slice_estimator(skl.base.BaseEstimator):
     def predict(self, X):
         skl.utils.validation.check_is_fitted(self)
         X = skl.utils.validation.check_array(X)
-        decision_value = np.mean([slice_estimator.decision_function(X) for slice_estimator in self.slice_estimators_], axis=0)
+        decision_value = self.decision_function(X)
         return np.sign(decision_value)
     def decision_function(self, X):
         skl.utils.validation.check_is_fitted(self)
-        return np.mean([slice_estimator.decision_function(X) for slice_estimator in self.slice_estimators_], axis=0)
+        decision_value = np.mean([slice_estimator.decision_function(X) for slice_estimator in self.slice_estimators_], axis=0)
+        if self.adjust_outer_bias:
+            decision_value += self.bias - self.mean_bias
+        return decision_value
     def score(self, X, y):
         skl.utils.validation.check_is_fitted(self)
         y_pred = self.predict(X)
@@ -1238,44 +1272,75 @@ def estimator_add_bias(X, f, bias):
     f_value = f(X) + bias
     return(f_value)
 
-def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, folds:int=5, filter=None, print_info=False):
+def hyperparameter_optimization(estimator, search_space:dict, vectors, labels, folds:int=5, limit=None, filter=None, mode='grid', seed=None, print_info=False):
     """Performs a hyperparameter optimization of an estimator object, in particular by cross validation with Stratified 5-Fold. Accuracy and Kappa value are applied as metric, and the optimization goes according to the Kappa value.
     Arguments:
                 estimator: estimator object with methods fit, predict and decision_function.
-               param_grid: dictionary with parameter names (str) as values and lists of values as values. Allowed parameters are:
+               search_space: dictionary with parameter names (str) as values and lists of values as values. Allowed parameters are:
                     - attributes of the estimator
                     - if estimator.kernel is callable and has attributes, the names of these attributes are allowed.
                     - if estimator is of class slice_estimator, the attributes of estimator.estimator are allowed
                   vectors: array of data vectors, of shape (N,d) with d>1.
                    labels: list or array of binary (1,-1) labels of shape (N).
                     folds: int, number of folds to use in the crossvalidation. Default is 5
-                   filter: callable with boolean outputs and parameters in param_grid as inputs, filters the grid. Default is None, which means no filtering.
+                    limit: int, number of parameter samples to be used. If mode='grid' is chosen, these will be random samples. Default is None, which means that for mode='grid' the whole grid is searched, while for mode='bayes' an estimate for the space size is chosen.
+                   filter: callable with boolean outputs and parameters in search_space as inputs, filters the grid. Default is None, which means no filtering.
+                     mode: 'grid' for full gridsearch or 'bayes' for Bayessearch. The search_space has to be compatible with the mode. If "bayes" is chosen, then the filter should be boolean, where True corresponds to splitting the search space to fit on the D-Wave Annealer. Default is 'grid'.
                print_info: Boolean wether info should be printed. Default is False.
 
     Returns:
         decision_function: classyfing function of the estimator fitted with the best parameters (with the best kappa value in the cross validation).
-           df_nice_sorted: pandas data frame of hyperparameter values and associated metrics in the cross validation.
+           param_table: pandas data frame of hyperparameter values and associated metrics in the cross validation.
               grid_search: sklearn.model_selection.GridSearchCV object fitted with the best parameters. Useful attributes are cv_results_, best_estimator_, and best_params_.
            optimal_params: dictionary of tzhe best parameters.
     """
     scoring = {'accuracy': 'accuracy', 'kappa': skl.metrics.make_scorer(skl.metrics.cohen_kappa_score)}
    # specify level of print detail
-    assert isinstance(print_info, (bool, int)), 'Wrong format of print_info. Try again with bool or int.'
+    assert isinstance(print_info, (bool, int, str)), 'Wrong format of print_info. Try again with bool or int.'
     if isinstance(print_info, bool):
         print_detail = 2 if print_info else 0
     elif isinstance(print_info, int):
         print_detail = print_info
+    elif isinstance(print_info, str):
+        print_detail = 0
     # prepare pipeline and grid:
-    pipeline, paramgrid = prepare_pipeline(estimator, param_grid, filter) 
-    # run grid search with cross validation:
-    grid_search = skl.model_selection.GridSearchCV(pipeline, paramgrid, scoring=scoring, cv=folds, refit='kappa', verbose=print_detail)
-    grid_search.fit(vectors, labels)
-    cv_results = grid_search.cv_results_
+    pipeline, searchspace, limit = prepare_pipeline(estimator, search_space, limit, filter, mode, seed)
+    # run parameter search with cross validation:
+    if mode == 'bayes':
+        opt = skopt.BayesSearchCV(pipeline, searchspace, scoring=scoring, cv=folds, n_iter=limit, refit='kappa', verbose=print_detail, random_state=seed, return_train_score=True, error_score=0)
+    else:
+        opt = skl.model_selection.GridSearchCV(pipeline, searchspace, scoring=scoring, cv=folds, refit='kappa', verbose=print_detail)
+    if mode == 'bayes' and (print_detail > 0 or (type(print_info) != bool and print_info == 0) or isinstance(print_info, str)):
+        def update_best_score(result):
+            iteration = len(result.x_iters)
+            score = result.fun
+            global best_score
+            if iteration == 1 or best_score is None:
+                best_score = score
+            elif score < best_score:
+                best_score = score
+                print('Iteration {}/{}: New best score found'.format(iteration, limit))
+            else:
+                print('Iteration {}/{}'.format(iteration, limit), end="\r")
+        opt.fit(vectors, labels, callback = [update_best_score])
+    else:
+        opt.fit(vectors, labels)
+    cv_results = opt.cv_results_
     # export dataframe:
+    param_table = cv_results_to_df(cv_results)
+    if print_info:
+        print(param_table.head())
+    optimal_params = opt.best_params_
+    decision_function = opt.best_estimator_.decision_function
+    return(decision_function, param_table, opt, optimal_params)
+
+def cv_results_to_df(cv_results):
     df_results = pd.DataFrame(cv_results)
-    df_results = df_results.applymap(lambda x: x.filled(np.nan) if isinstance(x, np.ma.MaskedArray) else x)
+    try:
+        df_results = df_results.map(lambda x: x.filled(np.nan) if isinstance(x, np.ma.MaskedArray) else x) # linux
+    except AttributeError:
+        df_results = df_results.applymap(lambda x: x.filled(np.nan) if isinstance(x, np.ma.MaskedArray) else x) # windows
     # Select relevant columns
-    # Typically, we are interested in params and mean_test_score
     params = df_results.iloc[:, 1:].filter(like="param_")
     scores = df_results[['mean_test_kappa', 'std_test_kappa']]
     # Relabel:
@@ -1284,20 +1349,16 @@ def hyperparameter_optimization(estimator, param_grid:dict, vectors, labels, fol
     # Combine params and scores into a single DataFrame
     df_nice = pd.concat([params, scores], axis=1)
     df_nice_sorted = df_nice.sort_values(by='mean kappa', ascending=False)
-    if print_info:
-        display(df_nice_sorted)
-    optimal_params = grid_search.best_params_
-    decision_function = grid_search.best_estimator_.decision_function
-    return(decision_function, df_nice_sorted, grid_search, optimal_params)
+    return df_nice_sorted
 
-def count_gridsearch_fits(estimator, param_grid:dict, vectors, labels, folds=5, filter=None):
+def count_hyperparameter_optimization_fits(estimator, search_space:dict, vectors, labels, folds=5, filter=None, limit=None, mode='grid', seed=None, print_info=False):
     """
     Estimates the number of fits that will be cast during a run of the function hyperparameter_optimization with the same parameters.
     This may be useful to estimate the computation time of a hyperparameter optimization run.
      
     Arguments:
                 estimator: estimator object with methods fit, predict and decision_function.
-               param_grid: dictionary with parameter names (str) as values and lists of values as values. Allowed parameters are:
+             search_space: dictionary with parameter names (str) as values and lists of values as values. Allowed parameters are:
                     - attributes of the estimator
                     - if estimator.kernel is callable and has attributes, the names of these attributes are allowed.
                     - if estimator is of class slice_estimator, the attributes of estimator.estimator are allowed
@@ -1305,6 +1366,8 @@ def count_gridsearch_fits(estimator, param_grid:dict, vectors, labels, folds=5, 
                    labels: list or array of binary (1,-1) labels of shape (N).
                     folds: int, number of folds to use in the crossvalidation. Default is 5
                    filter: callable with boolean outputs and parameters in param_grid as inputs, filters the grid. Default is None, which means no filtering.
+                    limit: int, number of parameter samples to be used. Default is None, which means that the whole grid is searched.
+                     mode: 'grid' for full gridsearch or 'bayes' for Bayessearch. The search_space has to be compatible with the mode. If "bayes" is chosen, then the filter should be boolean, where True corresponds to splitting the search space to fit on the D-Wave Annealer. Default is 'grid'.
 
     Returns:
                total_fits: Total number of fits performed during hyperparameter optimization.
@@ -1312,7 +1375,7 @@ def count_gridsearch_fits(estimator, param_grid:dict, vectors, labels, folds=5, 
     # reset fit counter:
     FitCounter.fit_counts_global = defaultdict(int)
     # prepare pipeline and grid:
-    pipeline, paramgrid = prepare_pipeline(estimator, param_grid, filter)
+    pipeline, searchspace, limit = prepare_pipeline(estimator, search_space, limit=limit, filter=filter, mode=mode, seed=seed, print_info=print_info)
     # Function to recursively replace base estimators (e.g., in ensemble methods) with FitCounter
     def replace_nested_estimators_with_fit_counter(estimator, step_name_prefix=''):
         if isinstance(estimator, skl.pipeline.Pipeline):
@@ -1332,31 +1395,40 @@ def count_gridsearch_fits(estimator, param_grid:dict, vectors, labels, folds=5, 
             return FitCounter(step_name=step_name_prefix)
         return estimator
     
-    pipeline, paramgrid = prepare_pipeline(estimator, param_grid, filter)
     # Replace the pipeline estimators with FitCounter at all levels
-    fit_counter_pipeline = replace_nested_estimators_with_fit_counter(pipeline)
-    
-    grid_search = skl.model_selection.GridSearchCV(fit_counter_pipeline, paramgrid, cv=folds, refit=True)
-    grid_search.fit(vectors, labels)
+    fit_counter_pipeline = replace_nested_estimators_with_fit_counter(copy.deepcopy(pipeline))
+    warnings.filterwarnings("ignore", category=UserWarning) # ignore annoying warnings that might come up due to trivial predictions
+    if mode == 'bayes':
+        opt = skopt.BayesSearchCV(fit_counter_pipeline, searchspace, cv=folds, n_iter=limit, refit=True, random_state=seed, error_score=0)
+    else:
+        opt = skl.model_selection.GridSearchCV(fit_counter_pipeline, searchspace, cv=folds, refit=True)
+    opt.fit(vectors, labels)
     # Get the global fit counts for all steps
     fit_counts = dict(FitCounter.fit_counts_global)
     total_fits = sum(fit_counts.values())
     return total_fits
 
-def prepare_pipeline(estimator, param_grid:dict, filter=None):
+def prepare_pipeline(estimator, search_space:dict, limit=None, filter=None, mode='grid', seed=None, print_info=False):
     """
-    Prepares the pipeline and paramgrid object for hyperparameter optimization.
+    Prepares the pipeline and searchspace object for hyperparameter optimization.
     In particular, the grid is filtered and the names of the parameters are adjusted. 
     Parameters:
     - estimator: Estimator object used for hyperparameter optimization
     - param_grid (dict): Dictionary where keys are parameter names and values are lists of parameter values.
     - filter (function): A function that takes the parameters as arguments and returns True or False.
+    - mode ("grid" or "bayes"): determines if GridSearch or BayesSearch is used.
     Returns:
     - pipeline: estimator object for hyperparameter optimization that can handle inner parameters.
-    - paramgrid: The adjusted parameter grid. If a filter was used, it is a list of dicts of singe parameter choices.
+    - searchspace: The adjusted parameter grid. If a filter was used, it is a list of dicts of singe parameter choices.
+    - limit: adjusted limit (chosen by default if mode = 'bayes' and limit is None)
     """
-    # filter grid:
-    paramgrid = filter_grid(param_grid, filter) if callable(filter) else param_grid.copy() # copy to not change the original param_grid
+    if mode == 'bayes' and filter:
+        slice_size = None if 'slice_size' in search_space else getattr(estimator, 'slice_size', None)
+        searchspace = split_dwave_search_space(search_space, slice_size)
+    elif callable(filter): # for gridsearch, filter grid
+        searchspace = filter_grid(search_space, filter)
+    else:
+        searchspace = search_space.copy() # copy to not change the original param_grid
     # check if kernel parameters have to be passed to the kernel parameters:
     def get_deep_attributes(estimator, attribute_name, condition=None):
         if condition is None:
@@ -1372,25 +1444,46 @@ def prepare_pipeline(estimator, param_grid:dict, filter=None):
     def extend_param_names(param_grid, param_names, prefix):
         grid_iterator = param_grid if isinstance(param_grid, list) else [param_grid]
         for param in param_names:
-            for paramgrid in grid_iterator:
-                if param in paramgrid:
-                    paramgrid[prefix + '__' + param] = paramgrid.pop(param)
+            for searchspace in grid_iterator:
+                if param in searchspace:
+                    searchspace[prefix + '__' + param] = searchspace.pop(param)
         return param_grid
     inner_kernel_params = get_deep_attributes(estimator, 'kernel', condition=callable)
-    paramgrid = extend_param_names(paramgrid, inner_kernel_params, 'kernel')
+    searchspace = extend_param_names(searchspace, inner_kernel_params, 'kernel')
     # check if estimator is the slice_estimator. If yes, we have to use a pipeline
     if isinstance(estimator, slice_estimator):
         inner_estimator_params = get_deep_attributes(estimator, 'estimator')
-        paramgrid = extend_param_names(paramgrid, inner_estimator_params, 'estimator')
+        searchspace = extend_param_names(searchspace, inner_estimator_params, 'estimator')
 
         inner_kernel_params = get_deep_attributes(estimator.estimator, 'kernel', condition=callable)
-        paramgrid = extend_param_names(paramgrid, inner_kernel_params, 'estimator__kernel')
+        searchspace = extend_param_names(searchspace, inner_kernel_params, 'estimator__kernel')
 
         pipeline = skl.pipeline.Pipeline([('sliced', estimator)])
-        paramgrid = extend_param_names(paramgrid, set().union(*(d.keys() for d in paramgrid)) if isinstance(paramgrid, list) else list(paramgrid.keys()), 'sliced')
+        searchspace = extend_param_names(searchspace, set().union(*(d.keys() for d in searchspace)) if isinstance(searchspace, list) else list(searchspace.keys()), 'sliced')
     else:
         pipeline = estimator
-    return pipeline, paramgrid
+    # limit number of parameter samples:
+    if mode == 'bayes' and limit is None: # change limit to a default value based on the estimated size of the search space
+        limit = int(sum([samples_per_size(size) for size in estimate_search_space_size(searchspace, samples_per_real_interval=6)]))
+        if print_info:
+            print('Limit: ', limit)
+    if limit is None or (mode == 'bayes' and (len(searchspace) == 1 or isinstance(searchspace, dict))):
+        sampled_grid = searchspace
+    elif mode == 'bayes':
+        search_space_sizes = estimate_search_space_size(searchspace, samples_per_real_interval=6)
+        relative_adjusted_limits = [samples_per_size(size) for size in search_space_sizes]
+        total_adjusted_limit = sum(relative_adjusted_limits)
+        search_space_limits = [round(limit * relative_limit / total_adjusted_limit + 0.1) for relative_limit in relative_adjusted_limits] # 0.1 bias for rounding up, correction happening below
+        while sum(search_space_limits) < limit: # adjust fewer samples due to rounding:
+            search_space_limits[np.argmin(search_space_limits)] += 1
+        while sum(search_space_limits) > limit: # adjust more samples due to rounding:
+            search_space_limits[np.argmax(search_space_limits)] -= 1
+        if print_info:
+            print('Search_space_limits: ', search_space_limits)
+        sampled_grid = list(zip(searchspace, search_space_limits))
+    else:
+        sampled_grid = [{key: [value] for key, value in param.items()} for param in skl.model_selection.ParameterSampler(searchspace, n_iter=limit, random_state=seed)]
+    return pipeline, sampled_grid, limit
 
 def filter_grid(param_grid, filter):
     """
@@ -1413,6 +1506,72 @@ def filter_grid(param_grid, filter):
         if filter(**dict(zip(param_names, values)))
     ]
     return filtered_combinations
+
+def estimate_search_space_size(search_spaces, samples_per_real_interval=5):
+    def estimate_dimenstion_size(dimension):
+        if isinstance(dimension, skopt.space.space.Categorical):
+                size = len(dimension.bounds)
+        else:
+            lower, upper = dimension.bounds
+            if dimension.prior == 'log-uniform':
+                size = np.emath.logn(dimension.base, upper) - np.emath.logn(dimension.base, lower)
+            else: # assume uniform distribution
+                size = upper - lower
+                if isinstance(dimension, skopt.space.space.Integer):
+                    size += 1
+            # correct to relative size for real intervals:
+            if isinstance(dimension, skopt.space.space.Real):
+                size /= upper
+        return size
+    if isinstance(search_spaces, dict):
+        searchspaces = [search_spaces.copy()]
+    else: 
+        searchspaces = search_spaces.copy()
+    total_sizes = []
+    for searchspace in searchspaces:
+        total_size = 1
+        for dimension in searchspace.values():
+            size = estimate_dimenstion_size(dimension)
+            if isinstance(dimension, skopt.space.space.Real): # just take a fixed number of samples per interval, disregarding the size of the actual real interval
+                size = samples_per_real_interval
+            total_size *= size
+        total_sizes += [total_size]
+    return total_sizes
+
+# function for choosing samples based on size of search space: Asymptotically its 10%, but for smaller values its more, up to 20%
+def samples_per_size(size, min=12):
+    ratio = lambda size: 0.34 * np.exp(-0.03 * size) + 0.12
+    return max(ratio(size) * size, min)
+
+def split_dwave_search_space(search_space, slice_size=None, max_qubo_dim=177):
+    if isinstance(search_space, dict) and 'num_encoding' in search_space and ('slice_size' in search_space or slice_size): # divide seach space such that num_encoding * slice_size <= max_qubo_dim is enforced
+        slice_sizes = search_space['slice_size'].bounds if 'slice_size' in search_space else [slice_size]
+        lower, upper = search_space['num_encoding'].bounds
+        num_encoding_space = np.arange(lower, upper + 1)
+        slice_size_per_num_encoding_space = {}
+        for slicesize in slice_sizes: # find maximum feasible parameter space for every slice size
+            filter = lambda num_encoding: num_encoding * slicesize <= max_qubo_dim
+            reduced_space = num_encoding_space[filter(num_encoding_space)]
+            reduced_bounds = (min(reduced_space),max(reduced_space))
+            if reduced_bounds in slice_size_per_num_encoding_space:
+                slice_size_per_num_encoding_space[reduced_bounds] += [slicesize]
+            else: 
+                slice_size_per_num_encoding_space[reduced_bounds] = [slicesize]
+        new_search_spaces = []
+        for reduced_bounds, slicesizes in slice_size_per_num_encoding_space.items():
+            partial_search_space = search_space.copy()
+            if len(set(reduced_bounds)) > 1:
+                num_encoding_dimension = skopt.space.Integer(*reduced_bounds, prior=search_space['num_encoding'].prior, base=search_space['num_encoding'].base)
+            else:
+                num_encoding_dimension = skopt.space.Categorical([reduced_bounds[0]])
+            slice_size_dimension = skopt.space.Categorical(slicesizes)
+            partial_search_space['num_encoding'] = num_encoding_dimension
+            if 'slice_size' in search_space:
+                partial_search_space['slice_size'] = slice_size_dimension
+            new_search_spaces += [partial_search_space]
+        return new_search_spaces
+    else:
+        return search_space.copy()
 
 class FitCounter(skl.base.BaseEstimator, skl.base.TransformerMixin):
     # Class-level dictionary to store fit counts globally for each step
